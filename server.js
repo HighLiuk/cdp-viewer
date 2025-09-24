@@ -3,7 +3,98 @@ import http from "http";
 import { WebSocketServer } from "ws";
 import CDP from "chrome-remote-interface";
 import { execFile } from "node:child_process";
-import { setTimeout as delay } from "node:timers/promises";
+import getPort from "get-port";
+import { chromium } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+
+chromium.use(StealthPlugin()); // stealth ON di default
+const registry = new Map();
+async function waitForDevtools(port, attempts = 40, sleepMs = 100) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/json/version`);
+      if (r.ok) return r.json();
+    } catch {}
+    await new Promise((r) => setTimeout(r, sleepMs));
+  }
+  throw new Error(`DevTools non raggiungibile su :${port}`);
+}
+
+async function createSession({
+  durationSec = 3600,
+  headless = true,
+  windowSize = [1280, 939],
+  locale = "it-IT",
+  timezone = "Europe/Rome",
+  stealth = true,
+  extraArgs = [],
+  port: fixedPort, // opzionale
+} = {}) {
+  const port = fixedPort || (await getPort());
+
+  // Se vuoi disattivare stealth per debug:
+  if (!stealth) chromium.plugins.clear();
+
+  const browser = await chromium.launch({
+    headless,
+    args: [
+      `--remote-debugging-port=${port}`,
+      `--window-size=${windowSize[0]},${windowSize[1]}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-dev-shm-usage",
+      "--no-sandbox",
+      ...extraArgs,
+    ],
+  });
+  await browser.newPage({
+    locale,
+    timezoneId: timezone,
+    viewport: { width: windowSize[0], height: windowSize[1] },
+  });
+
+  // Assicuriamoci che il DevTools sia up e leggiamo l'endpoint WS
+  const version = await waitForDevtools(port, 60, 150);
+  const wsBrowserUrl = version.webSocketDebuggerUrl;
+  const pid = await pidFromPort(port);
+
+  const id = wsBrowserUrl.split("/").pop();
+  const expiresAt =
+    durationSec > 0
+      ? new Date(Date.now() + durationSec * 1000).toISOString()
+      : null;
+
+  // Auto-shutdown
+  let timer = null;
+  if (durationSec > 0) {
+    timer = setTimeout(
+      () => destroySession(id).catch(() => {}),
+      durationSec * 1000
+    );
+  }
+
+  registry.set(id, {
+    id,
+    port,
+    wsBrowserUrl,
+    pid,
+    expiresAt,
+    timer,
+    browser,
+  });
+  return registry.get(id);
+}
+
+async function destroySession(id) {
+  const s = registry.get(id);
+  if (!s) return false;
+  try {
+    await s.browser?.close();
+  } catch {}
+  if (s.timer) clearTimeout(s.timer);
+  registry.delete(id);
+  return true;
+}
 
 // ---------- Utilities ----------
 function execFileP(cmd, args, opts = {}) {
@@ -18,6 +109,29 @@ function execFileP(cmd, args, opts = {}) {
       }
     );
   });
+}
+
+async function pidFromPort(port) {
+  try {
+    const { stdout } = await execFileP("lsof", [
+      "-nP",
+      `-iTCP:${port}`,
+      "-sTCP:LISTEN",
+      "-Fp",
+    ]);
+    const m = stdout.match(/p(\d+)/);
+    if (m) return Number(m[1]);
+  } catch {}
+
+  // Fallback Linux con ss (se lsof non c’è)
+  try {
+    const { stdout } = await execFileP("ss", ["-ltnp"]);
+    const line = stdout.split("\n").find((l) => l.includes(`:${port} `));
+    // estrae pid da users:(("chrome",pid=1234,fd=...))
+    const m = line && line.match(/pid=(\d+)/);
+    if (m) return Number(m[1]);
+  } catch {}
+  return null;
 }
 
 function httpOriginFromWs(wsUrl) {
@@ -36,92 +150,6 @@ async function fetchJson(url, timeoutMs = 500) {
   } finally {
     clearTimeout(t);
   }
-}
-
-// ---------- Session discovery (macOS/Linux) ----------
-const BROWSER_CMD_RE =
-  /(chrome|chromium|brave|edge|msedge|electron|headless|arc|opera)/i;
-
-async function listListeningPortsUnix() {
-  // Use lsof machine-readable output to map PID -> COMMAND -> PORT
-  // -F pcn prints fields: p=PID, c=COMMAND, n=NAME (contains host:port)
-  const { stdout } = await execFileP("lsof", [
-    "-nP",
-    "-iTCP",
-    "-sTCP:LISTEN",
-    "-F",
-    "pcn",
-  ]);
-  const lines = stdout.split(/\r?\n/);
-  const rows = [];
-  let cur = { pid: null, cmd: null };
-  for (const line of lines) {
-    if (!line) continue;
-    const tag = line[0],
-      val = line.slice(1);
-    if (tag === "p") {
-      cur = { pid: Number(val), cmd: cur.cmd };
-    } else if (tag === "c") {
-      cur.cmd = val;
-    } else if (tag === "n") {
-      // Expect ...:<port>
-      const m = val.match(/:(\d+)\b/);
-      if (m && cur.pid && cur.cmd) {
-        rows.push({ pid: cur.pid, cmd: cur.cmd, port: Number(m[1]) });
-      }
-    }
-  }
-  return rows;
-}
-
-async function discoverSessions() {
-  const sessions = [];
-  if (process.platform === "darwin" || process.platform === "linux") {
-    let ports = [];
-    try {
-      ports = await listListeningPortsUnix();
-    } catch (e) {
-      // lsof not available
-      return sessions;
-    }
-
-    // Keep only browser-like commands
-    const candidates = ports.filter((p) => BROWSER_CMD_RE.test(p.cmd));
-
-    // Probe each port for DevTools /json/version
-    const probes = await Promise.all(
-      candidates.map(async ({ pid, cmd, port }) => {
-        try {
-          const j = await fetchJson(
-            `http://127.0.0.1:${port}/json/version`,
-            500
-          );
-          if (j && j.webSocketDebuggerUrl) {
-            return {
-              pid,
-              port,
-              cmd,
-              browser: j.Browser || j["User-Agent"] || cmd,
-              wsBrowserUrl: j.webSocketDebuggerUrl,
-            };
-          }
-        } catch (_) {}
-        return null;
-      })
-    );
-
-    for (const s of probes) if (s) sessions.push(s);
-  } else {
-    // TODO: Implement Windows via netstat/PowerShell if needed
-    return sessions;
-  }
-  // Deduplicate by wsBrowserUrl (just in case)
-  const seen = new Set();
-  return sessions.filter((s) => {
-    if (seen.has(s.wsBrowserUrl)) return false;
-    seen.add(s.wsBrowserUrl);
-    return true;
-  });
 }
 
 // ---------- Active tab detection ----------
@@ -176,20 +204,42 @@ async function findActivePageWs(browserWs) {
 const app = express();
 const server = http.createServer(app);
 app.use(express.static("public"));
+app.use(express.json()); // per leggere body JSON nelle POST
 
-app.get("/sessions", async (req, res) => {
+// LIST: per la sidebar
+app.get("/sessions", (req, res) => {
+  const sessions = [...registry.values()].map((s) => ({
+    id: s.id,
+    port: s.port,
+    pid: s.pid,
+    ws: s.wsBrowserUrl,
+    expiresAt: s.expiresAt,
+  }));
+  res.json({ sessions });
+});
+
+// CREATE: avvia browser con Playwright+Stealth
+app.post("/session", async (req, res) => {
   try {
-    const list = await discoverSessions();
-    // Shape for UI
-    const ui = list.map((s) => ({
-      id: s.wsBrowserUrl,
-      label: `${s.browser} (pid:${s.pid}, port:${s.port})`,
-      browser: s.browser,
-      pid: s.pid,
-      port: s.port,
-      ws: s.wsBrowserUrl,
-    }));
-    res.json({ sessions: ui });
+    const sess = await createSession(req.body || {});
+    res.status(201).json({
+      id: sess.id,
+      port: sess.port,
+      pid: sess.pid,
+      ws: sess.wsBrowserUrl,
+      expiresAt: sess.expiresAt,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE: chiude e ripulisce
+app.delete("/session/:id", async (req, res) => {
+  try {
+    const ok = await destroySession(req.params.id);
+    if (!ok) return res.status(404).json({ error: "not found" });
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -278,3 +328,14 @@ server.listen(PORT, () => {
     "CDP Embed Viewer v4 (sessions + active tab) -> http://localhost:" + PORT
   );
 });
+
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, async () => {
+    for (const { id } of [...registry.values()]) {
+      try {
+        await destroySession(id);
+      } catch {}
+    }
+    process.exit(0);
+  });
+}
