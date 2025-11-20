@@ -2,6 +2,11 @@
 
 CDP_PORT=${CDP_PORT:-9222}
 MCP_PORT=${MCP_PORT:-8931}
+MCP_HOST=${MCP_HOST:-}
+
+if [ "$MCP_HOST" == "hostname" ]; then
+  MCP_HOST=$(hostname)
+fi
 
 cleanup() {
   echo "Received interrupt signal. Terminating processes..."
@@ -51,7 +56,8 @@ echo "🔗 Corrected CDP URL for MCP: $CDP_ENDPOINT_MODIFIED"
 
 exec npx @playwright/mcp \
     --cdp-endpoint "$CDP_ENDPOINT_MODIFIED" \
-    --port $MCP_PORT
+    --port $MCP_PORT \
+    --host=$MCP_HOST
 
 echo "❌ MCP server terminated unexpectedly."
 
